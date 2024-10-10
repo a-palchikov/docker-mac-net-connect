@@ -4,12 +4,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,105 +44,92 @@ const (
 )
 
 func main() {
-	logLevel := func() int {
-		switch os.Getenv("LOG_LEVEL") {
-		case "verbose", "debug":
-			return device.LogLevelVerbose
-		case "error":
-			return device.LogLevelError
-		case "silent":
-			return device.LogLevelSilent
-		}
-		return device.LogLevelVerbose
-	}()
+}
 
-	fmt.Printf("docker-mac-net-connect version '%s'\n", version.Version)
+func run() error {
+	level := slog.LevelDebug
+	if logLevel := os.Getenv("LOG_LEVEL"); logLevel != "" {
+		if err := level.UnmarshalText([]byte(logLevel)); err != nil {
+			return fmt.Errorf("invalid log level, expected one of %q or a <level><+-numeral>", loggingLevels)
+		}
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	}))
+
+	log.Info("docker-mac-net-connect", slog.String("version", version.Version))
 
 	tun, err := tun.CreateTUN("utun", device.DefaultMTU)
 	if err != nil {
-		fmt.Errorf("Failed to create TUN device: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("creating TUN device: %w", err)
 	}
 
 	interfaceName, err := tun.Name()
 	if err != nil {
-		fmt.Errorf("Failed to get TUN device name: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("getting TUN device name: %w", err)
 	}
 
-	logger := device.NewLogger(
-		logLevel,
-		fmt.Sprintf("(%s) ", interfaceName),
-	)
+	logger := log.With(slog.String("iface", interfaceName))
 
 	fileUAPI, err := ipc.UAPIOpen(interfaceName)
-
 	if err != nil {
-		logger.Errorf("UAPI listen error: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("opening UAPI: %w", err)
 	}
 
-	device := device.NewDevice(tun, conn.NewDefaultBind(), logger)
+	logw := slogWrapper{Logger: logger}
+	device := device.NewDevice(tun, conn.NewDefaultBind(), &device.Logger{Verbosef: logw.Verbosef, Errorf: logw.Errorf})
 
-	logger.Verbosef("Device started")
+	logger.Debug("Device started")
 
-	errs := make(chan error)
-	term := make(chan os.Signal, 1)
-
+	errChan := make(chan error, 1)
 	uapi, err := ipc.UAPIListen(interfaceName, fileUAPI)
 	if err != nil {
-		logger.Errorf("Failed to listen on UAPI socket: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("listening on UAPI socket: %w", err)
 	}
 
 	go func() {
 		for {
 			conn, err := uapi.Accept()
 			if err != nil {
-				errs <- err
+				errChan <- err
 				return
 			}
 			go device.IpcHandle(conn)
 		}
 	}()
 
-	logger.Verbosef("UAPI listener started")
+	logger.Debug("UAPI listener started")
 
 	// Wireguard configuration
-
-	hostPeerIp := "10.33.33.1"
-	vmPeerIp := "10.33.33.2"
+	const (
+		hostPeerIP = "10.33.33.1"
+		vmPeerIP   = "10.33.33.2"
+	)
 
 	c, err := wgctrl.New()
 	if err != nil {
-		logger.Errorf("Failed to create new wgctrl client: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("creating new wgctrl client: %w", err)
 	}
-
 	defer c.Close()
 
 	hostPrivateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
-		logger.Errorf("Failed to generate host private key: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("generate host private key: %w", err)
 	}
 
 	vmPrivateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
-		logger.Errorf("Failed to generate VM private key: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("generate VM private key: %w", err)
 	}
 
 	_, wildcardIpNet, err := net.ParseCIDR("0.0.0.0/0")
 	if err != nil {
-		logger.Errorf("Failed to parse wildcard CIDR: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("parsing wildcard CIDR: %w", err)
 	}
 
-	_, vmIpNet, err := net.ParseCIDR(vmPeerIp + "/32")
+	_, vmIpNet, err := net.ParseCIDR(vmPeerIP + "/32")
 	if err != nil {
-		logger.Errorf("Failed to parse VM peer CIDR: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("parsing VM peer CIDR: %w", err)
 	}
 
 	peer := wgtypes.PeerConfig{
@@ -157,44 +147,42 @@ func main() {
 		Peers:      []wgtypes.PeerConfig{peer},
 	})
 	if err != nil {
-		logger.Errorf("Failed to configure Wireguard device: %v\n", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("configuring Wireguard device: %w", err)
 	}
 
 	networkManager := networkmanager.New()
 
-	_, stderr, err := networkManager.SetInterfaceAddress(hostPeerIp, vmPeerIp, interfaceName)
+	_, stderr, err := networkManager.SetInterfaceAddress(hostPeerIP, vmPeerIP, interfaceName)
 	if err != nil {
-		logger.Errorf("Failed to set interface address with ifconfig: %v. %v", err, stderr)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("setting interface address with ifconfig (%s): %w", stderr, err)
 	}
 
-	logger.Verbosef("Interface %s created\n", interfaceName)
+	logger.Debug("Interface created", slog.String("iface", interfaceName))
 
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
-		logger.Errorf("Failed to create Docker client: %v", err)
-		os.Exit(ExitSetupFailed)
+		return fmt.Errorf("creating Docker client: %w", err)
 	}
 
-	logger.Verbosef("Wireguard server listening\n")
+	logger.Debug("Wireguard server listening")
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	go func() {
 		for {
-			logger.Verbosef("Setting up Wireguard on Docker Desktop VM\n")
+			logger.Debug("Setting up Wireguard on Docker Desktop VM")
 
-			err = setupVm(ctx, cli, port, hostPeerIp, vmPeerIp, hostPrivateKey, vmPrivateKey)
+			err = setupVm(ctx, cli, port, hostPeerIP, vmPeerIP, hostPrivateKey, vmPrivateKey, logger)
 			if err != nil {
-				logger.Errorf("Failed to setup VM: %v", err)
+				logger.Warn("Failed to setup VM", slog.Any("err", err))
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
 			networks, err := cli.NetworkList(ctx, types.NetworkListOptions{})
 			if err != nil {
-				logger.Errorf("Failed to list Docker networks: %v", err)
+				logger.Warn("Failed to list Docker networks", slog.Any("err", err))
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -203,7 +191,7 @@ func main() {
 				networkManager.ProcessDockerNetworkCreate(network, interfaceName)
 			}
 
-			logger.Verbosef("Watching Docker events\n")
+			logger.Debug("Watching Docker events")
 
 			msgs, errsChan := cli.Events(ctx, types.EventsOptions{
 				Filters: filters.NewArgs(
@@ -213,17 +201,20 @@ func main() {
 				),
 			})
 
-			for loop := true; loop; {
+			for {
 				select {
 				case err := <-errsChan:
-					logger.Errorf("Error: %v\n", err)
-					loop = false
+					select {
+					case errChan <- err:
+					case <-ctx.Done():
+					}
+					return
 				case msg := <-msgs:
 					// Add routes when new Docker networks are created
 					if msg.Type == "network" && msg.Action == "create" {
 						network, err := cli.NetworkInspect(ctx, msg.Actor.ID, types.NetworkInspectOptions{})
 						if err != nil {
-							logger.Errorf("Failed to inspect new Docker network: %v", err)
+							logger.Warn("Failed to inspect new Docker network", slog.Any("err", err))
 							continue
 						}
 
@@ -235,37 +226,33 @@ func main() {
 					if msg.Type == "network" && msg.Action == "destroy" {
 						network, exists := networkManager.DockerNetworks[msg.Actor.ID]
 						if !exists {
-							logger.Errorf("Unknown Docker network with ID %s. No routes will be removed.")
+							logger.Warn("Unknown Docker network. No routes will be removed.", slog.String("network", msg.Actor.ID))
 							continue
 						}
 
 						networkManager.ProcessDockerNetworkDestroy(network)
 						continue
 					}
+				case <-ctx.Done():
+					log.Debug("Context cancelled, closing routes loop")
+					return
 				}
 			}
-
-			time.Sleep(5 * time.Second)
 		}
 	}()
 
-	// Wait for program to terminate
-
-	signal.Notify(term, syscall.SIGTERM)
-	signal.Notify(term, os.Interrupt)
-
 	select {
-	case <-term:
-	case <-errs:
+	case <-ctx.Done():
+	case <-errChan:
 	case <-device.Wait():
 	}
 
 	// Clean up
-
 	uapi.Close()
 	device.Close()
 
-	logger.Verbosef("Shutting down\n")
+	logger.Debug("Shutting down")
+	return nil
 }
 
 func setupVm(
@@ -276,19 +263,20 @@ func setupVm(
 	vmPeerIp string,
 	hostPrivateKey wgtypes.Key,
 	vmPrivateKey wgtypes.Key,
+	log *slog.Logger,
 ) error {
 	imageName := fmt.Sprintf("%s:%s", version.SetupImage, version.Version)
 
 	_, _, err := dockerCli.ImageInspectWithRaw(ctx, imageName)
 	if err != nil {
-		fmt.Printf("Image doesn't exist locally. Pulling...\n")
+		log.Debug("Image doesn't exist locally. Pulling...")
 
 		pullStream, err := dockerCli.ImagePull(ctx, imageName, types.ImagePullOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to pull setup image: %w", err)
+			return fmt.Errorf("pulling setup image: %w", err)
 		}
 
-		io.Copy(os.Stdout, pullStream)
+		_, _ = io.Copy(os.Stdout, pullStream)
 	}
 
 	resp, err := dockerCli.ContainerCreate(ctx, &container.Config{
@@ -306,13 +294,13 @@ func setupVm(
 		CapAdd:      []string{"NET_ADMIN"},
 	}, nil, nil, "wireguard-setup")
 	if err != nil {
-		return fmt.Errorf("failed to create container: %w", err)
+		return fmt.Errorf("creating container: %w", err)
 	}
 
 	// Run container to completion
 	err = dockerCli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to start container: %w", err)
+		return fmt.Errorf("starting container: %w", err)
 	}
 
 	func() error {
@@ -322,7 +310,7 @@ func setupVm(
 			Follow:     true,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to get logs for container %s: %w", resp.ID, err)
+			return fmt.Errorf("getting logs for container %s: %w", resp.ID, err)
 		}
 
 		defer reader.Close()
@@ -335,7 +323,43 @@ func setupVm(
 		return nil
 	}()
 
-	fmt.Println("Setup container complete")
+	log.Info("Setup container complete")
 
 	return nil
 }
+
+type Level slog.Level
+
+func (r Level) String() string {
+	return strings.ToLower(slog.Level(r).String())
+}
+
+const (
+	DebugLevel = Level(slog.LevelDebug)
+	InfoLevel  = Level(slog.LevelInfo)
+	WarnLevel  = Level(slog.LevelWarn)
+	ErrorLevel = Level(slog.LevelError)
+)
+
+var loggingLevels = []string{
+	strings.ToLower(DebugLevel.String()),
+	strings.ToLower(InfoLevel.String()),
+	strings.ToLower(WarnLevel.String()),
+	strings.ToLower(ErrorLevel.String()),
+}
+
+func (r slogWrapper) Verbosef(format string, args ...any) {
+	m := fmt.Sprintf(format, args...)
+	r.Debug(m)
+}
+
+func (r slogWrapper) Errorf(format string, args ...any) {
+	m := fmt.Sprintf(format, args...)
+	r.Debug(m)
+}
+
+type slogWrapper struct {
+	*slog.Logger
+}
+
+var errSetupFailed = errors.New("setup failed")

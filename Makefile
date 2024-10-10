@@ -17,3 +17,8 @@ build-docker::
 
 build-push-docker::
 	docker buildx build --platform linux/amd64,linux/arm64 --push -t ${SETUP_IMAGE}:${VERSION} ./client
+
+.PHONY: service-start
+service-start:
+	@launchctl unload ~/Library/LaunchAgents/com.foobar.docker-mac-net-connect.plist || true
+	@launchctl load -w ~/Library/LaunchAgents/com.foobar.docker-mac-net-connect.plist

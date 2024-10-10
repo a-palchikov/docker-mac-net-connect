@@ -1,6 +1,6 @@
 module github.com/chipmk/docker-mac-net-connect
 
-go 1.17
+go 1.23
 
 require (
 	github.com/Microsoft/go-winio v0.4.17 // indirect
