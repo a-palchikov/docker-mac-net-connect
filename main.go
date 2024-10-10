@@ -44,6 +44,10 @@ const (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func run() error {
@@ -265,11 +269,11 @@ func setupVm(
 	vmPrivateKey wgtypes.Key,
 	log *slog.Logger,
 ) error {
-	imageName := fmt.Sprintf("%s:%s", version.SetupImage, version.Version)
+	imageName := fmt.Sprintf("%s:%s", version.SetupImage, getSetupImageVersion())
 
 	_, _, err := dockerCli.ImageInspectWithRaw(ctx, imageName)
 	if err != nil {
-		log.Debug("Image doesn't exist locally. Pulling...")
+		log.Debug("Image doesn't exist locally. Pulling...", slog.String("image", imageName))
 
 		pullStream, err := dockerCli.ImagePull(ctx, imageName, types.ImagePullOptions{})
 		if err != nil {
@@ -326,6 +330,13 @@ func setupVm(
 	log.Info("Setup container complete")
 
 	return nil
+}
+
+func getSetupImageVersion() string {
+	if imageTag := os.Getenv("DOCKER_MAC_NET_SETUP_IMAGE_TAG"); imageTag != "" {
+		return imageTag
+	}
+	return version.Version
 }
 
 type Level slog.Level

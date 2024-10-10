@@ -20,5 +20,5 @@ build-push-docker::
 
 .PHONY: service-start
 service-start:
-	@launchctl unload ~/Library/LaunchAgents/com.foobar.docker-mac-net-connect.plist || true
-	@launchctl load -w ~/Library/LaunchAgents/com.foobar.docker-mac-net-connect.plist
+	@sudo launchctl unload /Library/LaunchDaemons/com.foobar.docker-mac-net-connect.plist || true
+	@sudo launchctl load -w /Library/LaunchDaemons/com.foobar.docker-mac-net-connect.plist
